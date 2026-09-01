@@ -117,7 +117,9 @@ return
 			}
 
 			log.Printf("GPTFS TX id=%s bytes=%d", req.ID, len(payload))
-			window.ExecJS("window.__CHATGPT_GPTFS_RECEIVE__&&window.__CHATGPT_GPTFS_RECEIVE__(" + string(payload) + ")")
+			jsPayload := strings.ReplaceAll(string(payload), "\u2028", `\u2028`)
+			jsPayload = strings.ReplaceAll(jsPayload, "\u2029", `\u2029`)
+			window.ExecJS("window.__CHATGPT_GPTFS_RECEIVE__&&window.__CHATGPT_GPTFS_RECEIVE__(" + jsPayload + ")")
 			log.Printf("GPTFS TX queued id=%s", req.ID)
 		}(req)
 	},

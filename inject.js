@@ -26,6 +26,7 @@ const POLL_MS = 300
 const STABLE_MS = 1200
 const pending = new Map()
 const seen = new Set(JSON.parse(localStorage.getItem("gptfs.desktop.processed") || "[]"))
+const inFlight = new Set()
 const states = new Map()
 
 let armed = localStorage.getItem("gptfs.desktop.armed") === "1"
@@ -427,7 +428,7 @@ async function waitUntil(fn, timeout, interval = 100) {
 }
 
 function resultVisible(ids) {
-    if (!ids.length) return false
+    if (!ids || !ids.length) return false
     const text = userMessages().map(rawText).join("\n")
     return ids.some(id => text.includes(id))
 }
@@ -617,7 +618,34 @@ async function execute(items) {
 }
 
 function messageKey(el) {
-    return el?.dataset?.messageId || el?.getAttribute("data-message-id") || `anon:${hash(rawText(el))}`
+    if (!el) return "msg_unknown"
+    const dataId = el.dataset?.messageId || el.getAttribute("data-message-id")
+    if (dataId) return dataId
+    const turn = el.closest('[data-testid^="conversation-turn-"]')
+    if (turn) {
+        const tid = turn.getAttribute("data-testid")
+        if (tid) return tid
+    }
+    const all = assistantMessages()
+    const idx = all.indexOf(el)
+    if (idx >= 0) return `turn_${idx}`
+    return `msg_${hash(rawText(el).slice(0, 100))}`
+}
+
+function isTurnAlreadyAnswered(assistantEl) {
+    const all = [...document.querySelectorAll('[data-message-author-role]')]
+    const idx = all.indexOf(assistantEl)
+    if (idx < 0) return false
+    for (let i = idx + 1; i < all.length; i++) {
+        const m = all[i]
+        if (m.getAttribute("data-message-author-role") === "user") {
+            const txt = rawText(m)
+            if (txt.includes("@@GPTFS_RESULT") || txt.includes("@@DATA")) {
+                return true
+            }
+        }
+    }
+    return false
 }
 
 function stableText(el) {
@@ -635,50 +663,90 @@ function stableText(el) {
 
 async function deliver() {
     if (!pendingDelivery) return
-    if (!resultVisible(pendingDelivery.ids)) {
-        try {
-            await sendPrompt(pendingDelivery.text, pendingDelivery.ids)
+    if (resultVisible(pendingDelivery.ids)) {
+        for (const key of pendingDelivery.keys) seen.add(key)
+        saveSeen()
+        pendingDelivery = null
+        deliveryFailCount = 0
+        renderStatus()
+        return
+    }
+
+    try {
+        await sendPrompt(pendingDelivery.text, pendingDelivery.ids)
+        for (const key of pendingDelivery.keys) seen.add(key)
+        saveSeen()
+        pendingDelivery = null
+        deliveryFailCount = 0
+        renderStatus()
+    } catch (e) {
+        deliveryFailCount++
+        console.warn("[GPTFS] deliver failed (attempt " + deliveryFailCount + "):", e)
+        if (deliveryFailCount >= 3) {
+            console.error("[GPTFS] delivery failed repeatedly, dropping stuck delivery to avoid deadlock")
+            for (const key of pendingDelivery.keys) seen.add(key)
+            saveSeen()
+            pendingDelivery = null
             deliveryFailCount = 0
-        } catch (e) {
-            deliveryFailCount++
-            console.warn("[GPTFS] deliver failed (attempt " + deliveryFailCount + "):", e)
-            if (deliveryFailCount >= 4) {
-                console.error("[GPTFS] delivery failed repeatedly, dropping stuck delivery to avoid deadlock")
-                for (const key of pendingDelivery.keys) seen.add(key)
-                saveSeen()
-                pendingDelivery = null
-                deliveryFailCount = 0
-                renderStatus("ERR")
-                return
-            }
+            renderStatus("ERR")
+        } else {
             throw e
         }
     }
-    for (const key of pendingDelivery.keys) seen.add(key)
-    saveSeen()
-    pendingDelivery = null
-    deliveryFailCount = 0
-    renderStatus()
 }
 
 async function scan() {
     if (!armed || busy || hydrating) return
     busy = true
     try {
-        if (pendingDelivery) return await deliver()
+        if (pendingDelivery) {
+            await deliver()
+            return
+        }
+
         const list = assistantMessages()
+        if (!list.length) return
+
         for (let i = list.length - 1; i >= 0; i--) {
-            const el = list[i], text = stableText(el)
+            const el = list[i]
+            if (isTurnAlreadyAnswered(el)) {
+                break
+            }
+
+            const text = stableText(el)
             if (text == null) continue
+
             const mid = messageKey(el)
             if (baseline.has(mid)) continue
-            const fresh = parseRequests(text)
+
+            const allReqs = parseRequests(text)
+            if (!allReqs.length) continue
+
+            const fresh = allReqs
                 .map(x => ({ ...x, key: `${mid}:${hash(x.raw)}` }))
-                .filter(x => !seen.has(x.key))
+                .filter(x => !seen.has(x.key) && !inFlight.has(x.key))
+
             if (!fresh.length) continue
+
+            for (const x of fresh) {
+                inFlight.add(x.key)
+                seen.add(x.key)
+            }
+            saveSeen()
+
             renderStatus("WORK")
             const results = await execute(fresh)
-            pendingDelivery = { keys: fresh.map(x => x.key), ids: results.map(x => x.id), text: results.map(x => x.text).join("\n\n") }
+
+            for (const x of fresh) {
+                inFlight.delete(x.key)
+            }
+
+            pendingDelivery = {
+                keys: fresh.map(x => x.key),
+                ids: results.map(x => x.id),
+                text: results.map(x => x.text).join("\n\n")
+            }
+
             await deliver()
             break
         }
@@ -809,6 +877,7 @@ function buildUI() {
     panel.appendChild(makeButton("Force scan now", () => {
         panel.style.display = "none"
         states.clear()
+        inFlight.clear()
         hydrating = false
         if (armed) scan()
     }))
@@ -816,9 +885,11 @@ function buildUI() {
     panel.appendChild(makeButton("Forget handled requests", () => {
         seen.clear()
         saveSeen()
+        inFlight.clear()
         states.clear()
         pendingDelivery = null
         deliveryFailCount = 0
+        baseline = new Set(assistantMessages().filter(isTurnAlreadyAnswered).map(messageKey))
         panel.style.display = "none"
         renderStatus()
     }))
@@ -841,7 +912,7 @@ function updateHydration() {
 
     const list = assistantMessages()
     const signature = String(list.length) + ":" + list.map(function(x) {
-        return messageKey(x) + ":" + hash(rawText(x))
+        return messageKey(x) + ":" + hash(rawText(x).slice(0, 100))
     }).join("|")
 
     if (signature !== hydrateCount) {
@@ -867,6 +938,7 @@ function checkRoute() {
     busy = false
     pendingDelivery = null
     deliveryFailCount = 0
+    inFlight.clear()
     states.clear()
     hydrating = true
     hydrateCount = -1

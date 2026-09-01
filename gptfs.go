@@ -603,6 +603,8 @@ func execCmd(q Req) Res {
 		cmd.Dir = cwd
 	}
 
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "CI=true", "TERM=dumb")
+
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
