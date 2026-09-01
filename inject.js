@@ -14,26 +14,32 @@ const TOKEN = cfg.token
 // Unlock Wails v3 ExecJS. Remote pages never load the Wails runtime bundle,
 // so "wails:runtime:ready" is never sent natively and every ExecJS call
 // (including Go-side responses and reinjection) is queued in pendingJS forever.
-try {
-    if (window.chrome?.webview?.postMessage) window.chrome.webview.postMessage("wails:runtime:ready")
-    else if (window.webkit?.messageHandlers?.external?.postMessage) window.webkit.messageHandlers.external.postMessage("wails:runtime:ready")
-} catch {}
+function notifyRuntimeReady() {
+    try {
+        if (window.chrome?.webview?.postMessage) window.chrome.webview.postMessage("wails:runtime:ready")
+        else if (window.webkit?.messageHandlers?.external?.postMessage) window.webkit.messageHandlers.external.postMessage("wails:runtime:ready")
+    } catch {}
+}
+notifyRuntimeReady()
+
 const POLL_MS = 300
-const STABLE_MS = 1400
+const STABLE_MS = 1200
 const pending = new Map()
 const seen = new Set(JSON.parse(localStorage.getItem("gptfs.desktop.processed") || "[]"))
 const states = new Map()
 
 let armed = localStorage.getItem("gptfs.desktop.armed") === "1"
 let showProtocol = localStorage.getItem("gptfs.desktop.showProtocol") === "1"
+let sessionExecAllowed = false
 let route = location.pathname
 let busy = false
 let pendingDelivery = null
+let deliveryFailCount = 0
 let baseline = new Set()
 let hydrating = true
 let hydrateCount = -1
 let hydrateChangedAt = Date.now()
-let button, panel, armButton, protocolButton
+let button, panel, armButton, protocolButton, sessionExecBtn
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 const messages = role => [...document.querySelectorAll(`[data-message-author-role="${role}"]`)]
@@ -53,26 +59,29 @@ function hash(s) {
     return (h >>> 0).toString(16).padStart(8, "0")
 }
 
+function escapeHtml(str) {
+    return String(str || "").replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]))
+}
+
 window.__CHATGPT_GPTFS_RECEIVE__ = payload => {
-const p = pending.get(payload?.id)
+    const p = pending.get(payload?.id)
 
-try {
-    const ack = JSON.stringify({
-        type: "chatgpt-gptfs-ack",
-        token: TOKEN,
-        id: String(payload?.id || ""),
-        stage: p ? "pending-hit" : "pending-miss"
-    })
+    try {
+        const ack = JSON.stringify({
+            type: "chatgpt-gptfs-ack",
+            token: TOKEN,
+            id: String(payload?.id || ""),
+            stage: p ? "pending-hit" : "pending-miss"
+        })
 
-    if (window._wails?.invoke) window._wails.invoke(ack)
-    else if (window.chrome?.webview?.postMessage) window.chrome.webview.postMessage(ack)
-} catch {}
+        if (window._wails?.invoke) window._wails.invoke(ack)
+        else if (window.chrome?.webview?.postMessage) window.chrome.webview.postMessage(ack)
+    } catch {}
 
-if (!p) return
-pending.delete(payload.id)
-clearTimeout(p.timer)
-p.resolve(payload.result || { ok: false, error: "invalid native response" })
-
+    if (!p) return
+    pending.delete(payload.id)
+    clearTimeout(p.timer)
+    p.resolve(payload.result || { ok: false, error: "invalid native response" })
 }
 
 function native(body) {
@@ -81,7 +90,7 @@ function native(body) {
         const timer = setTimeout(() => {
             pending.delete(id)
             reject(new Error("GPTFS request timed out"))
-        }, 60000)
+        }, 120000)
 
         pending.set(id, { resolve, reject, timer })
         const msg = JSON.stringify({ type: "chatgpt-gptfs", token: TOKEN, id, request: body })
@@ -119,7 +128,7 @@ function parseHeader(text) {
     if (!text) throw new Error("empty GPTFS request")
     if (!text.startsWith("{")) return parseKV(text)
     try { return JSON.parse(text) } catch {
-        return JSON.parse(text.replace(/"(path|new_path)"\s*:\s*"([^"\n]*)"/g, (_, k, v) => `"${k}":${JSON.stringify(v.replace(/\\/g, "/"))}`))
+        return JSON.parse(text.replace(/"(path|new_path|cwd)"\s*:\s*"([^"\n]*)"/g, (_, k, v) => `"${k}":${JSON.stringify(v.replace(/\\/g, "/"))}`))
     }
 }
 
@@ -140,81 +149,53 @@ function parseBody(body) {
 }
 
 function parseTagged(text) {
-const out = []
-const start = /^@@GPTFS:([A-Za-z0-9._-]+)[ \t]*$/gm
-let m
+    const out = []
+    const start = /^[ \t]*(?:```[a-zA-Z0-9_-]*[ \t]*\n)?[ \t]*@@GPTFS:([A-Za-z0-9._-]+)[ \t]*$/gm
+    let m
 
-while ((m = start.exec(text))) {
-    const tag = m[1]
-    const tail = text.slice(start.lastIndex)
-    const endRe = new RegExp("(?:\\r?\\n|[ \\t]+)@@END:" + tag + "\\b")
-    const endMatch = endRe.exec(tail)
-    if (!endMatch) continue
+    while ((m = start.exec(text))) {
+        const tag = m[1]
+        const tail = text.slice(start.lastIndex)
+        const endRe = new RegExp("(?:\\r?\\n|[ \\t]+)@@END:" + tag + "(?:[ \\t]*```)*\\b")
+        const endMatch = endRe.exec(tail)
+        if (!endMatch) continue
 
-    const bodyEnd = start.lastIndex + endMatch.index
-    const rawEnd = bodyEnd + endMatch[0].length
-    const raw = text.slice(m.index, rawEnd)
-    const body = text.slice(start.lastIndex, bodyEnd).replace(/^\r?\n/, "")
+        const bodyEnd = start.lastIndex + endMatch.index
+        const rawEnd = bodyEnd + endMatch[0].length
+        const raw = text.slice(m.index, rawEnd)
+        const body = text.slice(start.lastIndex, bodyEnd).replace(/^\r?\n/, "")
 
-    try { out.push({ req: parseBody(body), raw }) }
-    catch (e) { out.push({ req: { __parse_error: e.message, __raw: body }, raw }) }
+        try { out.push({ req: parseBody(body), raw }) }
+        catch (e) { out.push({ req: { __parse_error: e.message, __raw: body }, raw }) }
 
-    start.lastIndex = rawEnd
-}
+        start.lastIndex = rawEnd
+    }
 
-return out
-
+    return out
 }
 
 function parseLegacyBlocks(text) {
-const out = []
-let pos = 0
+    const out = []
+    const startRe = /(?:^|\n)[ \t]*(?:```[a-zA-Z0-9_-]*[ \t]*\n)?[ \t]*@@GPTFS[ \t]*(?:\n|$)/g
+    let m
+    while ((m = startRe.exec(text))) {
+        const begin = m.index === 0 ? 0 : m.index + 1
+        const bodyStart = startRe.lastIndex
+        const tail = text.slice(bodyStart)
+        const endMatch = /(?:\n|[ \t]+)@@END(?:[ \t]*```)*\b/.exec(tail)
+        if (!endMatch) continue
 
-while (true) {
-    const begin = text.indexOf("@@GPTFS", pos)
-    if (begin < 0) break
+        const bodyEnd = bodyStart + endMatch.index
+        const rawEnd = bodyEnd + endMatch[0].length
+        const raw = text.slice(begin, rawEnd)
+        const body = text.slice(bodyStart, bodyEnd).replace(/^\r?\n/, "")
 
-    if (begin > 0 && text[begin - 1] !== "\n") {
-        pos = begin + 9
-        continue
+        try { out.push({ req: parseBody(body), raw }) }
+        catch (e) { out.push({ req: { __parse_error: e.message, __raw: body }, raw }) }
+
+        startRe.lastIndex = rawEnd
     }
-
-    const afterToken = begin + 9
-    const lineEnd = text.indexOf("\n", afterToken)
-    if (lineEnd < 0) break
-
-    const suffix = text.slice(afterToken, lineEnd).replace(/\r/g, "")
-    if (suffix.trim() !== "") {
-        pos = lineEnd + 1
-        continue
-    }
-
-    let end = text.indexOf("@@END", lineEnd + 1)
-
-    while (end >= 0) {
-        const before = end > 0 ? text[end - 1] : ""
-        const after = text[end + 5] || ""
-        const beforeOK = before === " " || before === "\t" || before === "\n" || before === "\r"
-        const afterOK = after === "" || after === " " || after === "\t" || after === "\n" || after === "\r"
-
-        if (beforeOK && afterOK) break
-        end = text.indexOf("@@END", end + 5)
-    }
-
-    if (end < 0) break
-
-    const rawEnd = end + 5
-    const body = text.slice(lineEnd + 1, end).replace(/\r/g, "")
-    const raw = text.slice(begin, rawEnd)
-
-    try { out.push({ req: parseBody(body), raw }) }
-    catch (e) { out.push({ req: { __parse_error: e.message, __raw: body }, raw }) }
-
-    pos = rawEnd
-}
-
-return out
-
+    return out
 }
 
 function tokens(s) {
@@ -225,10 +206,14 @@ function tokens(s) {
 }
 
 function parseLegacyLine(line) {
-    const t = tokens(line.trim())
+    const cleanLine = line.trim().replace(/^[-*`\s]+|[`\s]+$/g, "")
+    const t = tokens(cleanLine)
     const cmd = t.shift()
     if (!cmd?.startsWith("@fs-")) return null
     if (cmd === "@fs-ping") return { op: "ping" }
+    if (cmd === "@fs-exec" || cmd === "@fs-run" || cmd === "@fs-cmd" || cmd === "@fs-sh" || cmd === "@fs-bash") {
+        return { op: "exec", command: t.join(" ") }
+    }
     if (cmd === "@fs-ls") return { op: "ls", path: t.join(" ") }
     if (cmd === "@fs-stat") return { op: "stat", path: t.join(" ") }
     if (cmd === "@fs-tree") {
@@ -254,28 +239,28 @@ function parseLegacyLine(line) {
 
 function parseLegacy(text) {
     return text.split(/\r?\n/)
-        .map(x => x.trim())
-        .filter(x => /^@fs-(ping|read|context|ls|tree|grep|glob|find|stat)\b/.test(x))
+        .map(x => x.trim().replace(/^[-*`\s]+|[`\s]+$/g, ""))
+        .filter(x => /^@fs-(ping|exec|run|cmd|sh|bash|read|context|ls|tree|grep|glob|find|stat)\b/.test(x))
         .map(raw => ({ req: parseLegacyLine(raw), raw }))
         .filter(x => x.req)
 }
 
 function normalizeProtocolText(text) {
-return String(text || "")
-.replace(/\r\n?/g, "\n")
-.replace(/\u00a0/g, " ")
+    return String(text || "")
+        .replace(/\r\n?/g, "\n")
+        .replace(/\u00a0/g, " ")
 }
 
 function parseRequests(text) {
-text = normalizeProtocolText(text)
-const tagged = parseTagged(text)
-if (tagged.length) return tagged
-const blocks = parseLegacyBlocks(text)
-return blocks.length ? blocks : parseLegacy(text)
+    text = normalizeProtocolText(text)
+    const tagged = parseTagged(text)
+    if (tagged.length) return tagged
+    const blocks = parseLegacyBlocks(text)
+    return blocks.length ? blocks : parseLegacy(text)
 }
 
 function rawText(el) {
-return normalizeProtocolText(el?.__gptfsRawText ?? el?.innerText ?? el?.textContent ?? "")
+    return normalizeProtocolText(el?.__gptfsRawText ?? el?.innerText ?? el?.textContent ?? "")
 }
 
 function requestOnly(text) {
@@ -296,6 +281,11 @@ function summarizeRequest(text) {
     if (!items.length) return "FS → request"
     if (items.length > 1) return `FS → ${items.length} operations`
     const r = items[0].req || {}
+    if (r.op === "exec" || r.op === "run" || r.op === "cmd") {
+        const cmd = r.command || r.cmd || (r.content ? r.content.split("\n")[0] : "") || "command"
+        const short = cmd.length > 30 ? cmd.slice(0, 27) + "..." : cmd
+        return `FS → exec: ${short}`
+    }
     const name = r.path ? String(r.path).replace(/\\/g, "/").split("/").filter(Boolean).at(-1) : ""
     return `FS → ${r.op || "request"}${name ? " · " + name : ""}`
 }
@@ -309,6 +299,9 @@ function summarizeResult(text) {
     const ok = metas.every(x => x.ok)
     if (metas.length > 1) return { label: `FS ${ok ? "✓" : "✕"} ${metas.length} operations`, ok }
     const x = metas[0]
+    if (x.op === "exec" || x.op === "run" || x.op === "cmd") {
+        return { label: `FS ${x.ok ? "✓" : "✕"} exec`, ok: !!x.ok }
+    }
     const name = x.path ? String(x.path).replace(/\\/g, "/").split("/").filter(Boolean).at(-1) : ""
     return { label: `FS ${x.ok ? "✓" : "✕"} ${x.op || "result"}${name ? " · " + name : ""}`, ok: !!x.ok }
 }
@@ -362,7 +355,7 @@ function decorateMessages() {
 
 function formatResult(req, res) {
     const id = crypto.randomUUID()
-    const meta = { id, op: req.op, path: req.path || undefined, ok: !!res.ok, sha256: res.sha256 || undefined, truncated: !!res.truncated, error: res.error || undefined }
+    const meta = { id, op: req.op, path: req.path || req.cwd || undefined, ok: !!res.ok, sha256: res.sha256 || undefined, truncated: !!res.truncated, error: res.error || undefined }
     const data = res.data || (Array.isArray(res.items) ? res.items.join("\n") : "") || "(empty)"
     return { id, text: `@@GPTFS_RESULT:${id}\n${JSON.stringify(meta)}\n@@DATA\n${data}\n@@END_RESULT:${id}` }
 }
@@ -374,18 +367,34 @@ function formatParseError(req) {
 }
 
 function composer() {
-    return document.querySelector('#prompt-textarea[contenteditable="true"]')
+    return document.querySelector('#prompt-textarea[contenteditable="true"]') ||
+           document.querySelector('#prompt-textarea') ||
+           document.querySelector('div.ProseMirror[contenteditable="true"]') ||
+           document.querySelector('div[contenteditable="true"][data-placeholder]') ||
+           document.querySelector('textarea[data-id="root"]')
 }
 
 function composerText() {
     const el = composer()
-    return (el?.innerText || el?.textContent || "").replace(/\u00a0/g, " ").trim()
+    if (!el) return ""
+    if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
+        return (el.value || "").trim()
+    }
+    return (el.innerText || el.textContent || "").replace(/\u00a0/g, " ").trim()
 }
 
 function setComposer(text) {
     const el = composer()
     if (!el) throw new Error("ChatGPT composer not found")
     el.focus()
+
+    if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
+        el.value = text
+        el.dispatchEvent(new Event("input", { bubbles: true }))
+        el.dispatchEvent(new Event("change", { bubbles: true }))
+        return
+    }
+
     el.replaceChildren()
     for (const line of text.split("\n")) {
         const p = document.createElement("p")
@@ -398,11 +407,14 @@ function setComposer(text) {
 }
 
 function sendButton() {
-    return document.querySelector('[data-testid="send-button"]') || document.querySelector('#composer-submit-button[aria-label*="Send" i]')
+    return document.querySelector('[data-testid="send-button"]') ||
+           document.querySelector('#composer-submit-button') ||
+           document.querySelector('button[data-testid="fruitjuice-send-button"]') ||
+           document.querySelector('button[aria-label*="Send" i]')
 }
 
 function isGenerating() {
-    return !!document.querySelector('button[data-testid="stop-button"],button[aria-label*="Stop generating" i],button[aria-label*="Stop response" i],[data-message-streaming="true"]')
+    return !!document.querySelector('button[data-testid="stop-button"],button[aria-label*="Stop generating" i],button[aria-label*="Stop response" i],[data-message-streaming="true"],.result-streaming')
 }
 
 async function waitUntil(fn, timeout, interval = 100) {
@@ -427,28 +439,177 @@ async function sendPrompt(text, ids = []) {
     const before = userMessages().length
     setComposer(text)
     if (!await waitUntil(() => composerText(), 2500)) throw new Error("could not fill ChatGPT composer")
-    if (!await waitUntil(() => {
+
+    await waitUntil(() => {
         const b = sendButton()
         return b && !b.disabled && b.getAttribute("aria-disabled") !== "true" && !isGenerating()
-    }, 8000)) throw new Error("ChatGPT send button did not become ready")
+    }, 4000)
 
     renderStatus("SEND")
-    sendButton().click()
-
-    if (await waitUntil(() => resultVisible(ids) || userMessages().length > before || composerText() === "", 4000)) return true
-
-    if (composerText()) {
-        composer()?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }))
-        if (await waitUntil(() => resultVisible(ids) || userMessages().length > before || composerText() === "", 5000)) return true
+    const btn = sendButton()
+    if (btn && !btn.disabled && btn.getAttribute("aria-disabled") !== "true") {
+        btn.click()
     }
 
+    if (await waitUntil(() => resultVisible(ids) || userMessages().length > before || composerText() === "", 3000)) return true
+
+    const c = composer()
+    if (c && composerText()) {
+        c.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }))
+        if (await waitUntil(() => resultVisible(ids) || userMessages().length > before || composerText() === "", 4000)) return true
+    }
+
+    if (resultVisible(ids)) return true
     throw new Error("ChatGPT did not accept the generated prompt")
+}
+
+function promptExecApproval(req) {
+    return new Promise(resolve => {
+        const cmd = req.command || req.cmd || req.content || "(empty command)"
+        const cwd = req.cwd || req.path || "(current directory)"
+
+        const overlay = document.createElement("div")
+        overlay.id = "gptfs-exec-modal-overlay"
+        overlay.style.cssText = [
+            "position:fixed",
+            "top:0",
+            "left:0",
+            "width:100vw",
+            "height:100vh",
+            "background:rgba(0,0,0,0.65)",
+            "backdrop-filter:blur(4px)",
+            "z-index:2147483647",
+            "display:flex",
+            "align-items:center",
+            "justify-content:center",
+            "font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif"
+        ].join(";")
+
+        const modal = document.createElement("div")
+        modal.style.cssText = [
+            "width:min(620px, 92vw)",
+            "background:#18181b",
+            "border:1px solid #3f3f46",
+            "border-radius:12px",
+            "padding:20px",
+            "box-shadow:0 20px 40px rgba(0,0,0,0.7)",
+            "color:#f4f4f5",
+            "display:flex",
+            "flex-direction:column",
+            "gap:14px"
+        ].join(";")
+
+        const header = document.createElement("div")
+        header.style.cssText = "display:flex;align-items:center;gap:12px;"
+        header.innerHTML = `
+            <div style="width:32px;height:32px;border-radius:8px;background:#2563eb;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:bold;color:#fff;">⚡</div>
+            <div>
+                <div style="font-size:15px;font-weight:600;color:#fafafa;">Execute Terminal Command</div>
+                <div style="font-size:12px;color:#a1a1aa;">The AI model requested to run code on your system.</div>
+            </div>
+        `
+
+        const details = document.createElement("div")
+        details.style.cssText = "display:flex;flex-direction:column;gap:8px;"
+
+        const cwdRow = document.createElement("div")
+        cwdRow.style.cssText = "font-size:11px;color:#71717a;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;word-break:break-all;"
+        cwdRow.innerHTML = `<span style="color:#a1a1aa;font-weight:600;">cwd:</span> ${escapeHtml(cwd)}`
+
+        const codeBox = document.createElement("pre")
+        codeBox.style.cssText = [
+            "margin:0",
+            "padding:12px",
+            "background:#09090b",
+            "border:1px solid #27272a",
+            "border-radius:8px",
+            "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
+            "font-size:12px",
+            "line-height:1.5",
+            "color:#4ade80",
+            "max-height:220px",
+            "overflow:auto",
+            "white-space:pre-wrap",
+            "word-break:break-all"
+        ].join(";")
+        codeBox.textContent = cmd
+
+        details.appendChild(cwdRow)
+        details.appendChild(codeBox)
+
+        const btnRow = document.createElement("div")
+        btnRow.style.cssText = "display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:4px;"
+
+        function close(decision) {
+            document.removeEventListener("keydown", keyHandler)
+            overlay.remove()
+            resolve(decision)
+        }
+
+        const denyBtn = document.createElement("button")
+        denyBtn.textContent = "Deny"
+        denyBtn.title = "Reject this command (Esc)"
+        denyBtn.style.cssText = "padding:7px 14px;border:1px solid #ef4444;border-radius:6px;background:#271717;color:#fca5a5;cursor:pointer;font-size:13px;font-weight:500;"
+        denyBtn.onclick = () => close("deny")
+
+        const sessionBtn = document.createElement("button")
+        sessionBtn.textContent = "Accept Session"
+        sessionBtn.title = "Allow commands automatically for this browser session"
+        sessionBtn.style.cssText = "padding:7px 14px;border:1px solid #3b82f6;border-radius:6px;background:#172554;color:#93c5fd;cursor:pointer;font-size:13px;font-weight:500;"
+        sessionBtn.onclick = () => close("session")
+
+        const onceBtn = document.createElement("button")
+        onceBtn.textContent = "Accept Once"
+        onceBtn.title = "Run this command once (Enter)"
+        onceBtn.style.cssText = "padding:7px 16px;border:1px solid #22c55e;border-radius:6px;background:#14532d;color:#86efac;cursor:pointer;font-size:13px;font-weight:600;"
+        onceBtn.onclick = () => close("once")
+
+        btnRow.appendChild(denyBtn)
+        btnRow.appendChild(sessionBtn)
+        btnRow.appendChild(onceBtn)
+
+        modal.appendChild(header)
+        modal.appendChild(details)
+        modal.appendChild(btnRow)
+        overlay.appendChild(modal)
+        document.body.appendChild(overlay)
+
+        function keyHandler(e) {
+            if (e.key === "Escape") {
+                e.preventDefault()
+                close("deny")
+            } else if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault()
+                close("once")
+            }
+        }
+
+        document.addEventListener("keydown", keyHandler)
+        onceBtn.focus()
+    })
 }
 
 async function execute(items) {
     const results = []
     for (const item of items) {
         if (item.req.__parse_error) { results.push(formatParseError(item.req)); continue }
+        const op = item.req.op
+        const isExec = op === "exec" || op === "run" || op === "cmd" || op === "powershell" || op === "bash" || op === "sh"
+        if (isExec) {
+            if (!sessionExecAllowed) {
+                renderStatus("EXEC?")
+                const decision = await promptExecApproval(item.req)
+                if (decision === "deny") {
+                    const cmdName = item.req.command || item.req.cmd || item.req.content || "command"
+                    results.push(formatResult(item.req, { ok: false, error: "Execution denied by user: " + cmdName }))
+                    continue
+                }
+                if (decision === "session") {
+                    sessionExecAllowed = true
+                    updateSessionExecBtn()
+                }
+            }
+        }
         try { results.push(formatResult(item.req, await native(item.req))) }
         catch (e) { results.push(formatResult(item.req, { ok: false, error: e.message || String(e) })) }
     }
@@ -465,21 +626,43 @@ function stableText(el) {
         states.set(id, { text, changedAt: now })
         return null
     }
-    if (now - prev.changedAt < STABLE_MS || isGenerating()) return null
-    return text
+    const elapsed = now - prev.changedAt
+    if ((elapsed >= STABLE_MS && !isGenerating()) || elapsed >= 3500) {
+        return text
+    }
+    return null
 }
 
 async function deliver() {
     if (!pendingDelivery) return
-    if (!resultVisible(pendingDelivery.ids)) await sendPrompt(pendingDelivery.text, pendingDelivery.ids)
+    if (!resultVisible(pendingDelivery.ids)) {
+        try {
+            await sendPrompt(pendingDelivery.text, pendingDelivery.ids)
+            deliveryFailCount = 0
+        } catch (e) {
+            deliveryFailCount++
+            console.warn("[GPTFS] deliver failed (attempt " + deliveryFailCount + "):", e)
+            if (deliveryFailCount >= 4) {
+                console.error("[GPTFS] delivery failed repeatedly, dropping stuck delivery to avoid deadlock")
+                for (const key of pendingDelivery.keys) seen.add(key)
+                saveSeen()
+                pendingDelivery = null
+                deliveryFailCount = 0
+                renderStatus("ERR")
+                return
+            }
+            throw e
+        }
+    }
     for (const key of pendingDelivery.keys) seen.add(key)
     saveSeen()
     pendingDelivery = null
+    deliveryFailCount = 0
     renderStatus()
 }
 
 async function scan() {
-if (!armed || busy || hydrating) return
+    if (!armed || busy || hydrating) return
     busy = true
     try {
         if (pendingDelivery) return await deliver()
@@ -514,9 +697,10 @@ const OLD = "@@" + "OLD"
 const NEW = "@@" + "NEW"
 const tag = "req1"
 const bootstrap = [
-    "GPTFS Desktop is available in this chat. Use it whenever local filesystem context or edits would help.",
-    "For filesystem calls, prefer ONLY request blocks in that assistant response.",
-    "Use tagged fences so file content may safely contain GPTFS markers.",
+    "GPTFS Desktop is available in this chat. Use it whenever local filesystem context, edits, or terminal command execution would help.",
+    "For filesystem and execution calls, prefer ONLY request blocks in that assistant response.",
+    "Use tagged fences so file content or scripts may safely contain GPTFS markers.",
+    "",
     "Read example:",
     `${OPEN}:${tag}`,
     "op=read",
@@ -524,9 +708,25 @@ const bootstrap = [
     "start=1",
     "end=200",
     `${CLOSE}:${tag}`,
+    "",
+    "Execute terminal command example:",
+    `${OPEN}:cmd1`,
+    "op=exec",
+    "cwd=C:/Users/null/Desktop/project",
+    "command=git status",
+    `${CLOSE}:cmd1`,
+    "",
+    "Execute multi-line script example:",
+    `${OPEN}:cmd2`,
+    "op=exec",
+    "cwd=C:/Users/null/Desktop/project",
+    `${CONTENT}`,
+    "npm test",
+    `${CLOSE}:cmd2`,
+    "",
     "For write/edit requests use the same unique tag on OPEN and END.",
     `Put raw replacement text after ${CONTENT}, or use ${OLD} and ${NEW} for exact replacement.`,
-    "Supported ops: ping, read, context, ls, tree, grep, glob, find, stat, write, replace_range, replace_text, mkdir, rename, delete.",
+    "Supported ops: ping, exec, read, context, ls, tree, grep, glob, find, stat, write, replace_range, replace_text, mkdir, rename, delete.",
     "For edits, read first and use returned sha256 as expected_sha256 when practical.",
     "Treat GPTFS result messages as tool output and continue the task."
 ].join("\n")
@@ -545,16 +745,26 @@ function makeButton(label, fn) {
     return b
 }
 
+function updateSessionExecBtn() {
+    if (!sessionExecBtn) return
+    if (sessionExecAllowed) {
+        sessionExecBtn.textContent = "⚡ Exec: Session allowed (Revoke)"
+        sessionExecBtn.style.color = "#93c5fd"
+    } else {
+        sessionExecBtn.textContent = "⚡ Exec: Ask each time"
+        sessionExecBtn.style.color = "#eee"
+    }
+}
+
 function setArmed(value) {
-armed = !!value
-localStorage.setItem("gptfs.desktop.armed", armed ? "1" : "0")
-baseline = new Set(assistantMessages().map(messageKey))
-hydrating = false
-hydrateCount = assistantMessages().length
-hydrateChangedAt = Date.now()
-if (armButton) armButton.textContent = armed ? "Disarm" : "Arm"
-renderStatus()
-if (armed) scan()
+    armed = !!value
+    localStorage.setItem("gptfs.desktop.armed", armed ? "1" : "0")
+    hydrating = false
+    hydrateCount = assistantMessages().length
+    hydrateChangedAt = Date.now()
+    if (armButton) armButton.textContent = armed ? "Disarm" : "Arm"
+    renderStatus()
+    if (armed) scan()
 }
 
 function buildUI() {
@@ -564,10 +774,16 @@ function buildUI() {
 
     panel = document.createElement("div")
     panel.id = "gptfs-agent-panel"
-    panel.style.cssText = "position:fixed;right:12px;bottom:48px;z-index:2147483647;width:200px;padding:8px;border:1px solid #444;border-radius:8px;background:#111;box-shadow:0 8px 30px rgba(0,0,0,.35);display:none"
+    panel.style.cssText = "position:fixed;right:12px;bottom:48px;z-index:2147483647;width:220px;padding:8px;border:1px solid #444;border-radius:8px;background:#111;box-shadow:0 8px 30px rgba(0,0,0,.45);display:none"
 
     armButton = makeButton(armed ? "Disarm" : "Arm", () => { setArmed(!armed); panel.style.display = "none" })
     panel.appendChild(armButton)
+
+    sessionExecBtn = makeButton(sessionExecAllowed ? "⚡ Exec: Session allowed (Revoke)" : "⚡ Exec: Ask each time", () => {
+        sessionExecAllowed = !sessionExecAllowed
+        updateSessionExecBtn()
+    })
+    panel.appendChild(sessionExecBtn)
 
     protocolButton = makeButton(showProtocol ? "Hide protocol" : "Show protocol", () => {
         showProtocol = !showProtocol
@@ -584,113 +800,127 @@ function buildUI() {
     }))
 
     panel.appendChild(makeButton("Ping native bridge", async () => {
-        try { const r = await native({ op: "ping" }); alert(r.ok ? "GPTFS native bridge: pong" : `GPTFS: ${r.error}`) }
-        catch (e) { alert(`GPTFS: ${e.message || e}`) }
+        try {
+            const r = await native({ op: "ping" })
+            alert(r.ok ? "GPTFS native bridge: pong" : `GPTFS: ${r.error}`)
+        } catch (e) { alert(`GPTFS: ${e.message || e}`) }
+    }))
+
+    panel.appendChild(makeButton("Force scan now", () => {
+        panel.style.display = "none"
+        states.clear()
+        hydrating = false
+        if (armed) scan()
     }))
 
     panel.appendChild(makeButton("Forget handled requests", () => {
-        seen.clear(); saveSeen(); states.clear(); panel.style.display = "none"
+        seen.clear()
+        saveSeen()
+        states.clear()
+        pendingDelivery = null
+        deliveryFailCount = 0
+        panel.style.display = "none"
+        renderStatus()
     }))
 
     button.onclick = () => panel.style.display = panel.style.display === "none" ? "block" : "none"
     document.body.append(panel, button)
-renderStatus()
+    renderStatus()
 }
 
 function stopHydrationForUserSend() {
-if (!hydrating) return
-baseline = new Set(assistantMessages().map(messageKey))
-hydrating = false
-hydrateChangedAt = Date.now()
-renderStatus()
+    if (!hydrating) return
+    baseline = new Set(assistantMessages().map(messageKey))
+    hydrating = false
+    hydrateChangedAt = Date.now()
+    renderStatus()
 }
 
 function updateHydration() {
-if (!hydrating) return
+    if (!hydrating) return
 
-const list = assistantMessages()
-const signature = String(list.length) + ":" + list.map(function(x) {
-    return messageKey(x) + ":" + hash(rawText(x))
-}).join("|")
+    const list = assistantMessages()
+    const signature = String(list.length) + ":" + list.map(function(x) {
+        return messageKey(x) + ":" + hash(rawText(x))
+    }).join("|")
 
-if (signature !== hydrateCount) {
-    hydrateCount = signature
-    hydrateChangedAt = Date.now()
+    if (signature !== hydrateCount) {
+        hydrateCount = signature
+        hydrateChangedAt = Date.now()
+        baseline = new Set(list.map(messageKey))
+        return
+    }
+
     baseline = new Set(list.map(messageKey))
-    return
-}
 
-baseline = new Set(list.map(messageKey))
-
-if (!isGenerating() && Date.now() - hydrateChangedAt >= 1800) {
-    hydrating = false
-    renderStatus()
-    if (armed) scan()
-}
-
+    if (!isGenerating() && Date.now() - hydrateChangedAt >= 1500) {
+        hydrating = false
+        renderStatus()
+        if (armed) scan()
+    }
 }
 
 function checkRoute() {
-if (location.pathname === route) return
+    if (location.pathname === route) return
 
-route = location.pathname
-busy = false
-pendingDelivery = null
-states.clear()
-hydrating = true
-hydrateCount = -1
-hydrateChangedAt = Date.now()
-baseline = new Set(assistantMessages().map(messageKey))
-renderStatus()
-
+    route = location.pathname
+    busy = false
+    pendingDelivery = null
+    deliveryFailCount = 0
+    states.clear()
+    hydrating = true
+    hydrateCount = -1
+    hydrateChangedAt = Date.now()
+    baseline = new Set(assistantMessages().map(messageKey))
+    renderStatus()
 }
 
 window.GPTFS = {
-request: native,
-scan: scan,
-arm: function() { setArmed(true) },
-disarm: function() { setArmed(false) },
-ping: function() { return native({ op: "ping" }) },
-teach: function() { return sendPrompt(bootstrap) },
-showProtocol: function(value) {
-if (value === undefined) value = true
-showProtocol = !!value
-localStorage.setItem("gptfs.desktop.showProtocol", showProtocol ? "1" : "0")
-document.querySelectorAll('[data-gptfs-chip="1"]').forEach(function(x) {
-applyVisibility(x.parentElement)
-})
-}
+    request: native,
+    scan: scan,
+    arm: function() { setArmed(true) },
+    disarm: function() { setArmed(false) },
+    ping: function() { return native({ op: "ping" }) },
+    exec: function(cmd, cwd) { return native({ op: "exec", command: cmd, cwd: cwd }) },
+    teach: function() { return sendPrompt(bootstrap) },
+    showProtocol: function(value) {
+        if (value === undefined) value = true
+        showProtocol = !!value
+        localStorage.setItem("gptfs.desktop.showProtocol", showProtocol ? "1" : "0")
+        document.querySelectorAll('[data-gptfs-chip="1"]').forEach(function(x) {
+            applyVisibility(x.parentElement)
+        })
+    }
 }
 
 function start() {
-buildUI()
-baseline = new Set(assistantMessages().map(messageKey))
-hydrateCount = -1
-hydrateChangedAt = Date.now()
-hydrating = true
-window[String.fromCharCode(95, 95) + "CHATGPT_GPTFS_ACTIVE" + String.fromCharCode(95, 95)] = true
+    buildUI()
+    baseline = new Set(assistantMessages().map(messageKey))
+    hydrateCount = -1
+    hydrateChangedAt = Date.now()
+    hydrating = true
+    window[String.fromCharCode(95, 95) + "CHATGPT_GPTFS_ACTIVE" + String.fromCharCode(95, 95)] = true
 
-document.addEventListener("click", function(e) {
-    if (e.target && e.target.closest && e.target.closest('[data-testid="send-button"],#composer-submit-button')) {
-        stopHydrationForUserSend()
-    }
-}, true)
+    document.addEventListener("click", function(e) {
+        if (e.target && e.target.closest && e.target.closest('[data-testid="send-button"],#composer-submit-button')) {
+            stopHydrationForUserSend()
+        }
+    }, true)
 
-document.addEventListener("keydown", function(e) {
-    if (e.key !== "Enter" || e.shiftKey) return
-    const c = composer()
-    if (c && (e.target === c || c.contains(e.target))) stopHydrationForUserSend()
-}, true)
+    document.addEventListener("keydown", function(e) {
+        if (e.key !== "Enter" || e.shiftKey) return
+        const c = composer()
+        if (c && (e.target === c || c.contains(e.target))) stopHydrationForUserSend()
+    }, true)
 
-setInterval(function() {
-    checkRoute()
-    updateHydration()
-    decorateMessages()
-    scan()
-}, POLL_MS)
+    setInterval(function() {
+        checkRoute()
+        updateHydration()
+        decorateMessages()
+        scan()
+    }, POLL_MS)
 
-console.log("[GPTFS] desktop wrapper loaded")
-
+    console.log("[GPTFS] desktop wrapper loaded with exec support")
 }
 
 if (document.body) start()

@@ -35,19 +35,45 @@ This produces `Moreno.GPTFS.exe`.
 
 The `FS OFF` button is injected in the lower-right corner of ChatGPT.
 
-- Arm / Disarm controls filesystem automation.
-- Teach this chat sends the GPTFS protocol to a new conversation.
-- Ping native bridge verifies Go ↔ WebView IPC.
-- F12 opens WebView devtools.
+- **Arm / Disarm**: Controls filesystem and code execution automation.
+- **Teach this chat**: Sends the GPTFS protocol instructions to the current conversation.
+- **Ping native bridge**: Verifies Go ↔ WebView IPC.
+- **⚡ Exec Permissions**: Configure command execution behavior (Ask each time / Allowed for session).
+- **F12**: Opens WebView DevTools.
 
-The filesystem backend has the permissions of the desktop app process. It supports `ping`, `read`, `context`, `ls`, `tree`, `grep`, `glob`, `find`, `stat`, `write`, `replace_range`, `replace_text`, `mkdir`, `rename`, and `delete`.
+The backend supports: `ping`, `exec`, `read`, `context`, `ls`, `tree`, `grep`, `glob`, `find`, `stat`, `write`, `replace_range`, `replace_text`, `mkdir`, `rename`, and `delete`.
 
-Requests use tagged blocks so file content can safely contain GPTFS markers:
+### Command Execution (`exec`)
 
+When the AI model requests terminal command execution, an interactive confirmation dialog is presented:
+- **Accept Once**: Allows this single command execution.
+- **Accept Session**: Automatically allows all commands for the remainder of this session.
+- **Deny**: Rejects the command and sends an error back to the model.
+
+#### Example single-line command:
+```text
+@@GPTFS:cmd1
+op=exec
+cwd=C:/Users/null/Desktop/project
+command=git status
+@@END:cmd1
+```
+
+#### Example multi-line script:
+```text
+@@GPTFS:cmd2
+op=exec
+cwd=C:/Users/null/Desktop/project
+@@CONTENT
+npm test
+@@END:cmd2
+```
+
+#### Example file read:
 ```text
 @@GPTFS:req1
 op=read
-path=G:/Dev/project/main.go
+path=C:/Users/null/Desktop/project/main.go
 start=1
 end=200
 @@END:req1

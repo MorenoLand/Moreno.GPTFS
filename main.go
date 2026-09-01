@@ -86,7 +86,17 @@ return
 
 		go func(req nativeRequest) {
 			started := time.Now()
-			log.Printf("GPTFS RX id=%s op=%s path=%q", req.ID, req.Request.Op, req.Request.Path)
+			cmdPreview := req.Request.Command
+			if cmdPreview == "" {
+				cmdPreview = req.Request.Cmd
+			}
+			if cmdPreview == "" && (req.Request.Op == "exec" || req.Request.Op == "run") {
+				cmdPreview = req.Request.Content
+			}
+			if len(cmdPreview) > 60 {
+				cmdPreview = cmdPreview[:57] + "..."
+			}
+			log.Printf("GPTFS RX id=%s op=%s path=%q cmd=%q", req.ID, req.Request.Op, req.Request.Path, cmdPreview)
 
 			result := dispatch(req.Request)
 
@@ -158,7 +168,10 @@ func randomToken() string {
 }
 
 func trustedOrigin(info *application.OriginInfo) bool {
-	if info == nil || !isChatGPTOrigin(info.Origin) {
+	if info == nil {
+		return false
+	}
+	if info.Origin != "" && !isChatGPTOrigin(info.Origin) {
 		return false
 	}
 	if info.TopOrigin != "" && !isChatGPTOrigin(info.TopOrigin) {
@@ -168,12 +181,22 @@ func trustedOrigin(info *application.OriginInfo) bool {
 }
 
 func isChatGPTOrigin(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return true
+	}
 	u, err := url.Parse(raw)
-	if err != nil || !strings.EqualFold(u.Scheme, "https") {
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "" && !strings.EqualFold(u.Scheme, "https") && !strings.EqualFold(u.Scheme, "http") {
 		return false
 	}
 	host := strings.ToLower(u.Hostname())
-	return host == "chatgpt.com" || host == "www.chatgpt.com"
+	if host == "" {
+		host = strings.ToLower(raw)
+	}
+	return host == "chatgpt.com" || host == "www.chatgpt.com" || strings.HasSuffix(host, ".chatgpt.com")
 }
 
 func webviewDataDir() string {

@@ -2,15 +2,20 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -20,21 +25,26 @@ const (
 )
 
 type Req struct {
-	Op             string `json:"op"`
-	Path           string `json:"path,omitempty"`
-	NewPath        string `json:"new_path,omitempty"`
-	Query          string `json:"query,omitempty"`
-	Pattern        string `json:"pattern,omitempty"`
-	Start          int    `json:"start,omitempty"`
-	End            int    `json:"end,omitempty"`
-	Radius         int    `json:"radius,omitempty"`
-	Depth          int    `json:"depth,omitempty"`
-	Content        string `json:"content,omitempty"`
-	Old            string `json:"old,omitempty"`
-	New            string `json:"new,omitempty"`
-	ExpectedSHA256 string `json:"expected_sha256,omitempty"`
-	IgnoreCase     bool   `json:"ignore_case,omitempty"`
-	Recursive      bool   `json:"recursive,omitempty"`
+	Op             string   `json:"op"`
+	Path           string   `json:"path,omitempty"`
+	Cwd            string   `json:"cwd,omitempty"`
+	NewPath        string   `json:"new_path,omitempty"`
+	Command        string   `json:"command,omitempty"`
+	Cmd            string   `json:"cmd,omitempty"`
+	Args           []string `json:"args,omitempty"`
+	Query          string   `json:"query,omitempty"`
+	Pattern        string   `json:"pattern,omitempty"`
+	Start          int      `json:"start,omitempty"`
+	End            int      `json:"end,omitempty"`
+	Radius         int      `json:"radius,omitempty"`
+	Depth          int      `json:"depth,omitempty"`
+	Timeout        int      `json:"timeout,omitempty"`
+	Content        string   `json:"content,omitempty"`
+	Old            string   `json:"old,omitempty"`
+	New            string   `json:"new,omitempty"`
+	ExpectedSHA256 string   `json:"expected_sha256,omitempty"`
+	IgnoreCase     bool     `json:"ignore_case,omitempty"`
+	Recursive      bool     `json:"recursive,omitempty"`
 }
 
 type Res struct {
@@ -51,10 +61,12 @@ func dispatch(q Req) Res {
 	switch q.Op {
 	case "ping":
 		res = Res{Data: "pong"}
+	case "exec", "run", "cmd", "powershell", "bash", "sh":
+		res = execCmd(q)
 	case "read":
 		res = read(q)
 	case "context":
-		res = context(q)
+		res = readContext(q)
 	case "ls":
 		res = ls(q)
 	case "tree":
@@ -172,7 +184,7 @@ func read(q Req) Res {
 	return Res{Data: b.String(), Truncated: truncated, SHA256: hashBytes(raw)}
 }
 
-func context(q Req) Res {
+func readContext(q Req) Res {
 	if q.Start <= 0 {
 		return Res{Error: "line required in start"}
 	}
@@ -545,3 +557,106 @@ func fileMode(p string) os.FileMode {
 	}
 	return 0644
 }
+
+func execCmd(q Req) Res {
+	cmdStr := q.Command
+	if cmdStr == "" {
+		cmdStr = q.Cmd
+	}
+	if cmdStr == "" {
+		cmdStr = q.Content
+	}
+	cmdStr = strings.TrimSpace(cmdStr)
+	if cmdStr == "" {
+		return Res{Error: "exec requires a command"}
+	}
+
+	cwd := q.Cwd
+	if cwd == "" {
+		cwd = q.Path
+	}
+	if cwd != "" {
+		cwd = clean(cwd)
+	} else {
+		cwd = "."
+	}
+
+	timeoutSec := q.Timeout
+	if timeoutSec <= 0 {
+		timeoutSec = 60
+	}
+	if timeoutSec > 600 {
+		timeoutSec = 600
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cmdStr)
+	} else {
+		cmd = exec.CommandContext(ctx, "sh", "-c", cmdStr)
+	}
+
+	if cwd != "" && cwd != "." {
+		cmd.Dir = cwd
+	}
+
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+
+	err := cmd.Run()
+
+	outBytes := buf.Bytes()
+	truncated := false
+	const maxExecOutput = 512 * 1024 // 512KB
+	if len(outBytes) > maxExecOutput {
+		outBytes = outBytes[:maxExecOutput]
+		truncated = true
+	}
+
+	outStr := strings.TrimRight(string(outBytes), "\r\n")
+
+	if ctx.Err() == context.DeadlineExceeded {
+		return Res{
+			OK:        false,
+			Data:      outStr,
+			Error:     fmt.Sprintf("command timed out after %d seconds", timeoutSec),
+			Truncated: truncated,
+		}
+	}
+
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			errMsg := fmt.Sprintf("exit code %d", exitErr.ExitCode())
+			if outStr == "" {
+				outStr = errMsg
+			}
+			return Res{
+				OK:        false,
+				Data:      outStr,
+				Error:     errMsg,
+				Truncated: truncated,
+			}
+		}
+		return Res{
+			OK:        false,
+			Data:      outStr,
+			Error:     err.Error(),
+			Truncated: truncated,
+		}
+	}
+
+	if outStr == "" {
+		outStr = "(command finished with no output)"
+	}
+
+	return Res{
+		OK:        true,
+		Data:      outStr,
+		Truncated: truncated,
+	}
+}
+
