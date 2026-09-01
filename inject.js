@@ -4,16 +4,8 @@
 if (!/(^|\.)chatgpt\.com$/i.test(location.hostname)) return
 
 const cfg = window.__CHATGPT_GPTFS__
-if (!cfg?.token) return
-if (window.__CHATGPT_GPTFS_ACTIVE__ && document.getElementById("gptfs-agent-button")) return
-
 try { delete window.__CHATGPT_GPTFS__ } catch {}
 
-const TOKEN = cfg.token
-
-// Unlock Wails v3 ExecJS. Remote pages never load the Wails runtime bundle,
-// so "wails:runtime:ready" is never sent natively and every ExecJS call
-// (including Go-side responses and reinjection) is queued in pendingJS forever.
 function notifyRuntimeReady() {
     try {
         if (window.chrome?.webview?.postMessage) window.chrome.webview.postMessage("wails:runtime:ready")
@@ -22,9 +14,29 @@ function notifyRuntimeReady() {
 }
 notifyRuntimeReady()
 
+// STRICT SINGLETON GUARD:
+// If an instance is already running in this window context, update its token and exit immediately.
+// This prevents multiple concurrent scanning loops, duplicate IPC calls, and orphaned timeout cascades.
+if (window.__GPTFS_INSTANCE__) {
+    if (cfg?.token) window.__GPTFS_INSTANCE__.token = cfg.token
+    return
+}
+
+if (!cfg?.token) return
+const TOKEN = cfg.token
+
+window.__GPTFS_INSTANCE__ = {
+    token: TOKEN,
+    startedAt: Date.now()
+}
+
 const POLL_MS = 300
 const STABLE_MS = 1200
-const pending = new Map()
+
+// Shared IPC pending map on window to survive any potential re-binds
+window.__GPTFS_PENDING__ = window.__GPTFS_PENDING__ || new Map()
+const pending = window.__GPTFS_PENDING__
+
 const seen = new Set(JSON.parse(localStorage.getItem("gptfs.desktop.processed") || "[]"))
 const inFlight = new Set()
 const states = new Map()
@@ -65,13 +77,15 @@ function escapeHtml(str) {
 }
 
 window.__CHATGPT_GPTFS_RECEIVE__ = payload => {
-    const p = pending.get(payload?.id)
+    const id = String(payload?.id || "")
+    const p = pending.get(id)
+    const activeToken = window.__GPTFS_INSTANCE__?.token || TOKEN
 
     try {
         const ack = JSON.stringify({
             type: "chatgpt-gptfs-ack",
-            token: TOKEN,
-            id: String(payload?.id || ""),
+            token: activeToken,
+            id: id,
             stage: p ? "pending-hit" : "pending-miss"
         })
 
@@ -79,8 +93,11 @@ window.__CHATGPT_GPTFS_RECEIVE__ = payload => {
         else if (window.chrome?.webview?.postMessage) window.chrome.webview.postMessage(ack)
     } catch {}
 
-    if (!p) return
-    pending.delete(payload.id)
+    if (!p) {
+        console.warn("[GPTFS] receive: pending-miss for id:", id)
+        return
+    }
+    pending.delete(id)
     clearTimeout(p.timer)
     p.resolve(payload.result || { ok: false, error: "invalid native response" })
 }
@@ -88,13 +105,17 @@ window.__CHATGPT_GPTFS_RECEIVE__ = payload => {
 function native(body) {
     return new Promise((resolve, reject) => {
         const id = crypto.randomUUID()
+        const timeoutMs = (body.timeout ? (body.timeout + 15) : 90) * 1000
         const timer = setTimeout(() => {
-            pending.delete(id)
-            reject(new Error("GPTFS request timed out"))
-        }, 120000)
+            if (pending.has(id)) {
+                pending.delete(id)
+                reject(new Error("GPTFS request timed out after " + Math.round(timeoutMs / 1000) + "s"))
+            }
+        }, timeoutMs)
 
         pending.set(id, { resolve, reject, timer })
-        const msg = JSON.stringify({ type: "chatgpt-gptfs", token: TOKEN, id, request: body })
+        const token = window.__GPTFS_INSTANCE__?.token || TOKEN
+        const msg = JSON.stringify({ type: "chatgpt-gptfs", token, id, request: body })
 
         try {
             if (window._wails?.invoke) return void window._wails.invoke(msg)
@@ -741,9 +762,16 @@ async function scan() {
                 inFlight.delete(x.key)
             }
 
+            // Verify before delivering: if result was already delivered while executing (e.g. by prior send), skip
+            const resultIds = results.map(x => x.id)
+            if (resultVisible(resultIds)) {
+                renderStatus()
+                break
+            }
+
             pendingDelivery = {
                 keys: fresh.map(x => x.key),
-                ids: results.map(x => x.id),
+                ids: resultIds,
                 text: results.map(x => x.text).join("\n\n")
             }
 
@@ -836,6 +864,8 @@ function setArmed(value) {
 }
 
 function buildUI() {
+    if (document.getElementById("gptfs-agent-button")) return
+
     button = document.createElement("button")
     button.id = "gptfs-agent-button"
     button.style.cssText = "position:fixed;right:12px;bottom:12px;z-index:2147483647;padding:6px 9px;border:1px solid #444;border-radius:8px;background:#111;color:#aaa;cursor:pointer;font:bold 12px monospace"
