@@ -334,7 +334,7 @@ function decorate(el, label, ok = true) {
     if (!chip) {
         chip = document.createElement("div")
         chip.dataset.gptfsChip = "1"
-        chip.style.cssText = "align-self:flex-start;display:inline-flex;align-items:center;padding:4px 8px;margin:2px 0;border:1px solid #383838;border-radius:7px;background:#171717;font:11px ui-monospace,SFMono-Regular,Consolas,monospace;cursor:pointer;user-select:none"
+        chip.style.cssText = "align-self:flex-start;display:inline-flex;align-items:center;gap:8px;min-height:32px;padding:5px 11px;margin:1px 0;border:1px solid color-mix(in srgb,currentColor 24%,transparent);border-radius:10px;background:color-mix(in srgb,currentColor 7%,transparent);font:500 12px/1.3 ui-sans-serif,system-ui,-apple-system,sans-serif;letter-spacing:.01em;cursor:pointer;user-select:none"
         for (const child of [...el.children]) {
             child.dataset.gptfsOriginal = "1"
             child.dataset.gptfsOldDisplay = child.style.display || ""
@@ -345,7 +345,13 @@ function decorate(el, label, ok = true) {
         }
         el.appendChild(chip)
     }
-    chip.textContent = label
+    chip.replaceChildren()
+    const mark = document.createElement("span")
+    mark.textContent = ok ? "✓" : "!"
+    mark.style.cssText = "display:grid;place-items:center;width:18px;height:18px;border-radius:50%;background:color-mix(in srgb,currentColor 16%,transparent);font:700 11px/1 ui-sans-serif,system-ui"
+    const text = document.createElement("span")
+    text.textContent = label.replace(/^FS\s*(?:✓|✕)?\s*/, "")
+    chip.replaceChildren(mark, text)
     chip.style.color = ok ? "#91a89a" : "#d88"
     applyVisibility(el)
 }
@@ -362,7 +368,6 @@ function applyVisibility(el) {
 }
 
 function decorateMessages() {
-    if (isGenerating()) return
     for (const el of assistantMessages()) {
         const text = rawText(el)
         if (requestOnly(text)) decorate(el, summarizeRequest(text), true)
