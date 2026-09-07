@@ -6,8 +6,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,45 +20,102 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	maxFile    = 8 << 20
-	maxResults = 750
-	maxItems   = 3000
+	maxFile          = 8 << 20
+	maxResults       = 750
+	maxItems         = 3000
+	maxProcessBuffer = 1 << 20
 )
 
 type Req struct {
-	Op             string   `json:"op"`
-	Path           string   `json:"path,omitempty"`
-	Cwd            string   `json:"cwd,omitempty"`
-	NewPath        string   `json:"new_path,omitempty"`
-	Command        string   `json:"command,omitempty"`
-	Cmd            string   `json:"cmd,omitempty"`
-	Args           []string `json:"args,omitempty"`
-	Query          string   `json:"query,omitempty"`
-	Pattern        string   `json:"pattern,omitempty"`
-	Start          int      `json:"start,omitempty"`
-	End            int      `json:"end,omitempty"`
-	Radius         int      `json:"radius,omitempty"`
-	Depth          int      `json:"depth,omitempty"`
-	Timeout        int      `json:"timeout,omitempty"`
-	Content        string   `json:"content,omitempty"`
-	Old            string   `json:"old,omitempty"`
-	New            string   `json:"new,omitempty"`
-	ExpectedSHA256 string   `json:"expected_sha256,omitempty"`
-	IgnoreCase     bool     `json:"ignore_case,omitempty"`
-	Recursive      bool     `json:"recursive,omitempty"`
+	Op             string
+	Path           string
+	Cwd            string
+	NewPath        string
+	Command        string
+	Cmd            string
+	Args           []string
+	Session        string
+	URL            string
+	Method         string
+	Header         string
+	ContentType    string
+	Accept         string
+	Query          string
+	Pattern        string
+	Start          int
+	End            int
+	Radius         int
+	Depth          int
+	Timeout        int
+	Content        string
+	Old            string
+	New            string
+	ExpectedSHA256 string
+	IgnoreCase     bool
+	Recursive      bool
+	Newline        bool
+}
+
+func (r *Req) UnmarshalJSON(b []byte) error {
+	type plain Req
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	*r = Req(p)
+
+	var extra map[string]json.RawMessage
+	if err := json.Unmarshal(b, &extra); err != nil {
+		return err
+	}
+	for key, dst := range map[string]any{
+		"new_path":        &r.NewPath,
+		"content_type":    &r.ContentType,
+		"expected_sha256": &r.ExpectedSHA256,
+		"ignore_case":     &r.IgnoreCase,
+	} {
+		if raw, ok := extra[key]; ok {
+			if err := json.Unmarshal(raw, dst); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+
 }
 
 type Res struct {
-	OK        bool     `json:"ok"`
-	Data      string   `json:"data,omitempty"`
-	Items     []string `json:"items,omitempty"`
-	Error     string   `json:"error,omitempty"`
-	Truncated bool     `json:"truncated,omitempty"`
-	SHA256    string   `json:"sha256,omitempty"`
+	OK        bool
+	Data      string
+	Items     []string
+	Error     string
+	Truncated bool
+	SHA256    string
+}
+
+func (r Res) MarshalJSON() ([]byte, error) {
+	m := map[string]any{"ok": r.OK}
+	if r.Data != "" {
+		m["data"] = r.Data
+	}
+	if len(r.Items) > 0 {
+		m["items"] = r.Items
+	}
+	if r.Error != "" {
+		m["error"] = r.Error
+	}
+	if r.Truncated {
+		m["truncated"] = true
+	}
+	if r.SHA256 != "" {
+		m["sha256"] = r.SHA256
+	}
+	return json.Marshal(m)
 }
 
 func dispatch(q Req) Res {
@@ -63,6 +125,18 @@ func dispatch(q Req) Res {
 		res = Res{Data: "pong"}
 	case "exec", "run", "cmd", "powershell", "bash", "sh":
 		res = execCmd(q)
+	case "spawn":
+		res = spawnProcess(q)
+	case "stdin":
+		res = processStdin(q)
+	case "proc_read":
+		res = processRead(q)
+	case "kill":
+		res = killProcess(q)
+	case "proc_list":
+		res = listProcesses()
+	case "http":
+		res = httpRequest(q)
 	case "read":
 		res = read(q)
 	case "context":
@@ -558,6 +632,352 @@ func fileMode(p string) os.FileMode {
 	return 0644
 }
 
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	n := len(p)
+	if n >= maxProcessBuffer {
+		b.b.Reset()
+		_, _ = b.b.Write(p[n-maxProcessBuffer:])
+		return n, nil
+	}
+	if over := b.b.Len() + n - maxProcessBuffer; over > 0 {
+		b.b.Next(over)
+	}
+	_, _ = b.b.Write(p)
+	return n, nil
+
+}
+func (b *lockedBuffer) take() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s := b.b.String()
+	b.b.Reset()
+	return s
+}
+
+type processSession struct {
+	id       string
+	cmd      *exec.Cmd
+	stdin    io.WriteCloser
+	stdout   lockedBuffer
+	stderr   lockedBuffer
+	mu       sync.Mutex
+	running  bool
+	exitCode int
+	waitErr  string
+}
+
+var (
+	processMu       sync.Mutex
+	processSessions = map[string]*processSession{}
+)
+
+func spawnProcess(q Req) Res {
+	name := strings.TrimSpace(q.Command)
+	if name == "" {
+		name = strings.TrimSpace(q.Cmd)
+	}
+	if name == "" {
+		return Res{Error: "spawn requires command"}
+	}
+
+	cmd := exec.Command(name, q.Args...)
+	configureCommand(cmd)
+
+	cwd := strings.TrimSpace(q.Cwd)
+	if cwd == "" {
+		cwd = strings.TrimSpace(q.Path)
+	}
+	if cwd != "" {
+		cmd.Dir = clean(cwd)
+	}
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "CI=true", "TERM=dumb")
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return Res{Error: err.Error()}
+	}
+
+	s := &processSession{
+		id:       randomToken()[:16],
+		cmd:      cmd,
+		stdin:    stdin,
+		running:  true,
+		exitCode: -1,
+	}
+	cmd.Stdout = &s.stdout
+	cmd.Stderr = &s.stderr
+
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		return Res{Error: err.Error()}
+	}
+
+	processMu.Lock()
+	processSessions[s.id] = s
+	processMu.Unlock()
+
+	go func() {
+		err := cmd.Wait()
+		s.mu.Lock()
+		s.running = false
+		if cmd.ProcessState != nil {
+			s.exitCode = cmd.ProcessState.ExitCode()
+		}
+		if err != nil {
+			s.waitErr = err.Error()
+		}
+		s.mu.Unlock()
+	}()
+
+	return Res{Data: fmt.Sprintf(`{"session":%q,"pid":%d,"running":true}`, s.id, cmd.Process.Pid)}
+
+}
+
+func processStdin(q Req) Res {
+	s, err := getProcessSession(q.Session)
+	if err != nil {
+		return Res{Error: err.Error()}
+	}
+
+	s.mu.Lock()
+	running := s.running
+	s.mu.Unlock()
+	if !running {
+		return Res{Error: "process is not running"}
+	}
+
+	data := q.Content
+	if q.Newline {
+		data += "\n"
+	}
+	if data == "" {
+		return Res{Error: "stdin requires content"}
+	}
+	n, err := io.WriteString(s.stdin, data)
+	if err != nil {
+		return Res{Error: err.Error()}
+	}
+	return Res{Data: fmt.Sprintf(`{"session":%q,"written":%d}`, s.id, n)}
+
+}
+
+func processRead(q Req) Res {
+	s, err := getProcessSession(q.Session)
+	if err != nil {
+		return Res{Error: err.Error()}
+	}
+
+	stdout := s.stdout.take()
+	stderr := s.stderr.take()
+
+	s.mu.Lock()
+	running := s.running
+	exitCode := s.exitCode
+	waitErr := s.waitErr
+	pid := 0
+	if s.cmd.Process != nil {
+		pid = s.cmd.Process.Pid
+	}
+	s.mu.Unlock()
+
+	payload, _ := json.Marshal(map[string]any{
+		"session":    s.id,
+		"pid":        pid,
+		"running":    running,
+		"exit_code":  exitCode,
+		"stdout":     stdout,
+		"stderr":     stderr,
+		"wait_error": waitErr,
+	})
+	return Res{Data: string(payload)}
+
+}
+
+func killProcess(q Req) Res {
+	s, err := getProcessSession(q.Session)
+	if err != nil {
+		return Res{Error: err.Error()}
+	}
+
+	s.mu.Lock()
+	running := s.running
+	s.mu.Unlock()
+
+	if running && s.cmd.Process != nil {
+		if err := s.cmd.Process.Kill(); err != nil {
+			return Res{Error: err.Error()}
+		}
+	}
+	_ = s.stdin.Close()
+
+	return Res{Data: fmt.Sprintf(`{"session":%q,"killed":%t}`, s.id, running)}
+
+}
+
+func listProcesses() Res {
+	processMu.Lock()
+	defer processMu.Unlock()
+
+	items := make([]string, 0, len(processSessions))
+	for id, s := range processSessions {
+		s.mu.Lock()
+		running := s.running
+		exitCode := s.exitCode
+		pid := 0
+		if s.cmd.Process != nil {
+			pid = s.cmd.Process.Pid
+		}
+		s.mu.Unlock()
+		items = append(items, fmt.Sprintf("%s pid=%d running=%t exit=%d", id, pid, running, exitCode))
+	}
+	sort.Strings(items)
+	return Res{Items: items}
+
+}
+
+func getProcessSession(id string) (*processSession, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, fmt.Errorf("session is required")
+	}
+	processMu.Lock()
+	s := processSessions[id]
+	processMu.Unlock()
+	if s == nil {
+		return nil, fmt.Errorf("unknown process session: %s", id)
+	}
+	return s, nil
+}
+
+func httpRequest(q Req) Res {
+	rawURL := strings.TrimSpace(q.URL)
+	if rawURL == "" {
+		rawURL = strings.TrimSpace(q.Path)
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return Res{Error: "http requires a valid url"}
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return Res{Error: "http only supports http/https"}
+	}
+	if !loopbackHost(u.Hostname()) {
+		return Res{Error: "http is restricted to localhost/loopback"}
+	}
+
+	method := strings.ToUpper(strings.TrimSpace(q.Method))
+	if method == "" {
+		if q.Content != "" {
+			method = http.MethodPost
+		} else {
+			method = http.MethodGet
+		}
+	}
+
+	timeoutSec := q.Timeout
+	if timeoutSec <= 0 {
+		timeoutSec = 15
+	}
+	if timeoutSec > 120 {
+		timeoutSec = 120
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), strings.NewReader(q.Content))
+	if err != nil {
+		return Res{Error: err.Error()}
+	}
+	if q.ContentType != "" {
+		req.Header.Set("Content-Type", q.ContentType)
+	}
+	if q.Accept != "" {
+		req.Header.Set("Accept", q.Accept)
+	}
+	for _, line := range strings.FieldsFunc(q.Header, func(r rune) bool { return r == '\n' || r == ';' }) {
+		k, v, ok := strings.Cut(line, ":")
+		if ok && strings.TrimSpace(k) != "" {
+			req.Header.Set(strings.TrimSpace(k), strings.TrimSpace(v))
+		}
+	}
+
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	client := &http.Client{
+		Timeout: time.Duration(timeoutSec) * time.Second,
+		Transport: &http.Transport{
+			Proxy: nil,
+			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				host, _, err := net.SplitHostPort(address)
+				if err != nil {
+					return nil, err
+				}
+				if !loopbackHost(host) {
+					return nil, fmt.Errorf("blocked non-loopback address: %s", host)
+				}
+				return dialer.DialContext(ctx, network, address)
+			},
+		},
+		CheckRedirect: func(next *http.Request, via []*http.Request) error {
+			if !loopbackHost(next.URL.Hostname()) {
+				return fmt.Errorf("blocked redirect to non-loopback host")
+			}
+			if len(via) >= 5 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return Res{Error: err.Error()}
+	}
+	defer resp.Body.Close()
+
+	const maxHTTPOutput = 512 * 1024
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPOutput+1))
+	if err != nil {
+		return Res{Error: err.Error()}
+	}
+	truncated := len(body) > maxHTTPOutput
+	if truncated {
+		body = body[:maxHTTPOutput]
+	}
+
+	var out strings.Builder
+	fmt.Fprintf(&out, "HTTP %d %s\n", resp.StatusCode, resp.Status)
+	for k, values := range resp.Header {
+		for _, v := range values {
+			fmt.Fprintf(&out, "%s: %s\n", k, v)
+		}
+	}
+	if len(body) > 0 {
+		out.WriteByte('\n')
+		out.Write(body)
+	}
+
+	return Res{Data: strings.TrimRight(out.String(), "\r\n"), Truncated: truncated}
+
+}
+
+func loopbackHost(host string) bool {
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func execCmd(q Req) Res {
 	cmdStr := q.Command
 	if cmdStr == "" {
@@ -598,6 +1018,7 @@ func execCmd(q Req) Res {
 	} else {
 		cmd = exec.CommandContext(ctx, "sh", "-c", cmdStr)
 	}
+	configureCommand(cmd)
 
 	if cwd != "" && cwd != "." {
 		cmd.Dir = cwd
@@ -661,4 +1082,3 @@ func execCmd(q Req) Res {
 		Truncated: truncated,
 	}
 }
-

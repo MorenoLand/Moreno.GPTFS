@@ -130,19 +130,20 @@ function native(body) {
 }
 
 function parseKV(text) {
-    const out = {}
-    for (const raw of text.split("\n")) {
-        const line = raw.trim()
-        if (!line || line.startsWith("#")) continue
-        const i = line.indexOf("=")
-        if (i < 1) throw new Error(`invalid header line: ${line}`)
-        const key = line.slice(0, i).trim()
-        let value = line.slice(i + 1).trim()
-        if (/^(true|false)$/i.test(value)) value = value.toLowerCase() === "true"
-        else if (/^-?\d+$/.test(value)) value = Number(value)
-        out[key] = value
-    }
-    return out
+const out = {}
+for (const raw of text.split("\n")) {
+const line = raw.trim()
+if (!line || line.startsWith("#")) continue
+const i = line.indexOf("=")
+if (i < 1) throw new Error("invalid header line: " + line)
+const key = line.slice(0, i).trim()
+let value = line.slice(i + 1).trim()
+if (key === "args" && value.startsWith("[")) value = JSON.parse(value)
+else if (/^(true|false)$/i.test(value)) value = value.toLowerCase() === "true"
+else if (/^-?\d+$/.test(value)) value = Number(value)
+out[key] = value
+}
+return out
 }
 
 function parseHeader(text) {
@@ -617,30 +618,30 @@ function promptExecApproval(req) {
 }
 
 async function execute(items) {
-    const results = []
-    for (const item of items) {
-        if (item.req.__parse_error) { results.push(formatParseError(item.req)); continue }
-        const op = item.req.op
-        const isExec = op === "exec" || op === "run" || op === "cmd" || op === "powershell" || op === "bash" || op === "sh"
-        if (isExec) {
-            if (!sessionExecAllowed) {
-                renderStatus("EXEC?")
-                const decision = await promptExecApproval(item.req)
-                if (decision === "deny") {
-                    const cmdName = item.req.command || item.req.cmd || item.req.content || "command"
-                    results.push(formatResult(item.req, { ok: false, error: "Execution denied by user: " + cmdName }))
-                    continue
-                }
-                if (decision === "session") {
-                    sessionExecAllowed = true
-                    updateSessionExecBtn()
-                }
-            }
-        }
-        try { results.push(formatResult(item.req, await native(item.req))) }
-        catch (e) { results.push(formatResult(item.req, { ok: false, error: e.message || String(e) })) }
-    }
-    return results
+const results = []
+for (const item of items) {
+if (item.req.__parse_error) { results.push(formatParseError(item.req)); continue }
+const op = item.req.op
+const isExec = op === "exec" || op === "run" || op === "cmd" || op === "powershell" || op === "bash" || op === "sh" || op === "spawn" || op === "stdin" || op === "kill"
+if (isExec) {
+if (!sessionExecAllowed) {
+renderStatus("EXEC?")
+const decision = await promptExecApproval(item.req)
+if (decision === "deny") {
+const cmdName = item.req.command || item.req.cmd || item.req.session || item.req.content || "command"
+results.push(formatResult(item.req, { ok: false, error: "Execution denied by user: " + cmdName }))
+continue
+}
+if (decision === "session") {
+sessionExecAllowed = true
+updateSessionExecBtn()
+}
+}
+}
+try { results.push(formatResult(item.req, await native(item.req))) }
+catch (e) { results.push(formatResult(item.req, { ok: false, error: e.message || String(e) })) }
+}
+return results
 }
 
 function messageKey(el) {
@@ -825,11 +826,12 @@ const bootstrap = [
     "npm test",
     `${CLOSE}:cmd2`,
     "",
-    "For write/edit requests use the same unique tag on OPEN and END.",
-    `Put raw replacement text after ${CONTENT}, or use ${OLD} and ${NEW} for exact replacement.`,
-    "Supported ops: ping, exec, read, context, ls, tree, grep, glob, find, stat, write, replace_range, replace_text, mkdir, rename, delete.",
-    "For edits, read first and use returned sha256 as expected_sha256 when practical.",
-    "Treat GPTFS result messages as tool output and continue the task."
+"For write/edit requests use the same unique tag on OPEN and END.",
+"Put raw replacement text after @@CONTENT, or use @@OLD and @@NEW for exact replacement.",
+"Supported ops: ping, exec, spawn, stdin, proc_read, proc_list, kill, http, read, context, ls, tree, grep, glob, find, stat, write, replace_range, replace_text, mkdir, rename, delete.",
+'Persistent stdio: spawn with command plus args=["arg1","arg2"] returns a session; stdin writes content to it; proc_read drains new stdout/stderr; kill stops it.',
+"For edits, read first and use returned sha256 as expected_sha256 when practical.",
+"Treat GPTFS result messages as tool output and continue the task."
 ].join("\n")
 
 function renderStatus(state = armed ? "ON" : "OFF") {
