@@ -17,7 +17,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -59,6 +58,7 @@ type Req struct {
 	IgnoreCase     bool
 	Recursive      bool
 	Newline        bool
+	DryRun         bool
 }
 
 func (r *Req) UnmarshalJSON(b []byte) error {
@@ -78,6 +78,7 @@ func (r *Req) UnmarshalJSON(b []byte) error {
 		"content_type":    &r.ContentType,
 		"expected_sha256": &r.ExpectedSHA256,
 		"ignore_case":     &r.IgnoreCase,
+		"dry_run":         &r.DryRun,
 	} {
 		if raw, ok := extra[key]; ok {
 			if err := json.Unmarshal(raw, dst); err != nil {
@@ -135,6 +136,8 @@ func dispatch(q Req) Res {
 		res = killProcess(q)
 	case "proc_list":
 		res = listProcesses()
+	case "kill_mcps":
+		res = killMCPs(q)
 	case "http":
 		res = httpRequest(q)
 	case "read":
@@ -1012,13 +1015,10 @@ func execCmd(q Req) Res {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cmdStr)
-	} else {
-		cmd = exec.CommandContext(ctx, "sh", "-c", cmdStr)
+	cmd, err := commandForScript(ctx, cmdStr)
+	if err != nil {
+		return Res{Error: err.Error()}
 	}
-	configureCommand(cmd)
 
 	if cwd != "" && cwd != "." {
 		cmd.Dir = cwd
@@ -1030,7 +1030,7 @@ func execCmd(q Req) Res {
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 
-	err := cmd.Run()
+	err = cmd.Run()
 
 	outBytes := buf.Bytes()
 	truncated := false

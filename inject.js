@@ -362,7 +362,12 @@ function applyVisibility(el) {
     if (!chip) return
     const reveal = showProtocol || el.dataset.gptfsReveal === "1"
     for (const child of [...el.children]) {
-        if (child.dataset.gptfsOriginal === "1") child.style.display = reveal ? (child.dataset.gptfsOldDisplay || "") : "none"
+        if (child === chip) continue
+        if (!child.dataset.gptfsOriginal) {
+            child.dataset.gptfsOriginal = "1"
+            child.dataset.gptfsOldDisplay = child.style.display || ""
+        }
+        child.style.display = reveal ? (child.dataset.gptfsOldDisplay || "") : "none"
     }
     chip.style.display = "inline-flex"
     chip.title = reveal ? "Click to collapse GPTFS protocol" : "Click to reveal GPTFS protocol"
@@ -828,7 +833,8 @@ const bootstrap = [
     "",
 "For write/edit requests use the same unique tag on OPEN and END.",
 "Put raw replacement text after @@CONTENT, or use @@OLD and @@NEW for exact replacement.",
-"Supported ops: ping, exec, spawn, stdin, proc_read, proc_list, kill, http, read, context, ls, tree, grep, glob, find, stat, write, replace_range, replace_text, mkdir, rename, delete.",
+"Supported ops: ping, exec, spawn, stdin, proc_read, proc_list, kill, kill_mcps, http, read, context, ls, tree, grep, glob, find, stat, write, replace_range, replace_text, mkdir, rename, delete.",
+'Codex MCPs: kill_mcps reads ~/.codex/config.toml and terminates only configured MCP process trees attached to Codex; set dry_run=true to list matches without terminating them.',
 'Persistent stdio: spawn with command plus args=["arg1","arg2"] returns a session; stdin writes content to it; proc_read drains new stdout/stderr; kill stops it.',
 "For edits, read first and use returned sha256 as expected_sha256 when practical.",
 "Treat GPTFS result messages as tool output and continue the task."
