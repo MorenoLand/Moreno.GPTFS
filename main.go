@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"log"
@@ -24,6 +25,7 @@ type nativeRequest struct {
 	Token   string
 	ID      string
 	Stage   string
+	Action  string
 	Request Req
 }
 
@@ -43,18 +45,20 @@ func main() {
 	}
 
 	token := randomToken()
-	config, _ := json.Marshal(map[string]string{"token": token})
+	config, _ := json.Marshal(map[string]string{"token": token, "icon": "data:image/png;base64," + base64.StdEncoding.EncodeToString(icon)})
 	injectedJS := "window.__CHATGPT_GPTFS__=" + string(config) + ";\n" + string(injector)
 
 	dataDir := webviewDataDir()
 	_ = os.MkdirAll(dataDir, 0700)
 
-	app := application.New(application.Options{
+	var app *application.App
+	app = application.New(application.Options{
 		Name:        "Moreno.GPTFS",
 		Description: "ChatGPT desktop wrapper with local filesystem tools",
 		Icon:        icon,
 		Windows: application.WindowsOptions{
 			WebviewUserDataPath: dataDir,
+			WndProcInterceptor:  roundWindowsWindow,
 		},
 		RawMessageHandler: func(window application.Window, message string, originInfo *application.OriginInfo) {
 			if !trustedOrigin(originInfo) {
@@ -68,6 +72,22 @@ func main() {
 			if err := json.Unmarshal([]byte(message), &req); err != nil {
 				if strings.Contains(message, "chatgpt-gptfs") {
 					log.Printf("GPTFS RX rejected: invalid JSON: %v", err)
+				}
+				return
+			}
+			if req.Type == "chatgpt-gptfs-window" {
+				if req.Token != token {
+					return
+				}
+				switch req.Action {
+				case "hide":
+					window.Hide()
+				case "minimise":
+					window.Minimise()
+				case "maximise":
+					window.ToggleMaximise()
+				case "close":
+					app.Quit()
 				}
 				return
 			}
@@ -146,9 +166,12 @@ func main() {
 		DevToolsEnabled:    true,
 		ZoomControlEnabled: true,
 		Windows: application.WindowsWindow{
-			GeneralAutofillEnabled:  true,
-			PasswordAutosaveEnabled: true,
+			GeneralAutofillEnabled:            true,
+			PasswordAutosaveEnabled:           true,
+			NonClientRegionSupport:            true,
+			DisableFramelessWindowDecorations: true,
 		},
+		Frameless: true,
 		KeyBindings: map[string]func(application.Window){
 			"F12": func(w application.Window) { w.OpenDevTools() },
 		},
@@ -158,6 +181,15 @@ func main() {
 		log.Println("GPTFS: navigation completed; reinjecting")
 		window.ExecJS(injectedJS)
 	})
+	window.OnWindowEvent(events.Windows.WindowClosing, func(_ *application.WindowEvent) { window.Hide() })
+
+	trayMenu := application.NewMenu()
+	trayMenu.Add("Show Moreno.GPTFS").OnClick(func(*application.Context) { window.Show().Focus() })
+	trayMenu.AddSeparator()
+	trayMenu.Add("Exit").OnClick(func(*application.Context) { app.Quit() })
+	tray := app.SystemTray.New().SetIcon(icon)
+	tray.SetTooltip("Moreno.GPTFS")
+	tray.AttachWindow(window).SetMenu(trayMenu).OnClick(func() { tray.ToggleWindow() }).OnRightClick(func() { tray.ShowMenu() })
 
 	window.Show()
 	if err := app.Run(); err != nil {

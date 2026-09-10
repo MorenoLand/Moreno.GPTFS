@@ -299,6 +299,52 @@ function resultOnly(text) {
     return text.replace(/@@GPTFS_RESULT(?::[A-Za-z0-9._-]+)?[\s\S]*?@@END_RESULT(?::[A-Za-z0-9._-]+)?/g, "").trim() === ""
 }
 
+function windowAction(action) {
+    try {
+        const token = window.__GPTFS_INSTANCE__?.token || TOKEN
+        const msg = JSON.stringify({ type: "chatgpt-gptfs-window", token, action })
+        if (window._wails?.invoke) window._wails.invoke(msg)
+        else if (window.chrome?.webview?.postMessage) window.chrome.webview.postMessage(msg)
+    } catch {}
+}
+
+function buildTitlebar() {
+    if (document.getElementById("gptfs-titlebar")) return
+    const bar = document.createElement("div")
+    bar.id = "gptfs-titlebar"
+    bar.style.cssText = "position:fixed;inset:0 0 auto 0;height:38px;z-index:2147483646;display:flex;align-items:center;background:#000;border-bottom:1px solid #2f2f2f;border-radius:14px 14px 0 0;color:#ececf1;font:12px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;app-region:drag;user-select:none;overflow:hidden"
+    const brand = document.createElement("div")
+    brand.textContent = "Moreno.GPTFS"
+    brand.style.cssText = "display:flex;align-items:center;gap:8px;padding:0 14px;flex:1;font-weight:600;letter-spacing:.01em"
+    if (cfg?.icon) {
+        const icon = document.createElement("img")
+        icon.src = cfg.icon
+        icon.alt = ""
+        icon.draggable = false
+        icon.style.cssText = "width:20px;height:20px;border-radius:6px;object-fit:cover"
+        brand.prepend(icon)
+    }
+    bar.appendChild(brand)
+    const controls = document.createElement("div")
+    controls.style.cssText = "height:100%;display:flex;align-items:stretch;app-region:no-drag"
+    const control = (label, action, hover) => {
+        const button = document.createElement("button")
+        button.type = "button"
+        button.textContent = label
+        button.title = action === "hide" ? "Hide to system tray" : action === "close" ? "Close" : action === "minimise" ? "Minimize" : "Maximize"
+        button.style.cssText = `width:46px;border:0;background:transparent;color:#b8b8c0;font:16px 'Segoe UI Symbol',sans-serif;cursor:pointer;app-region:no-drag`
+        button.onmouseenter = () => { button.style.background = hover }
+        button.onmouseleave = () => { button.style.background = "transparent" }
+        button.onclick = () => windowAction(action)
+        return button
+    }
+    controls.append(control("—", "minimise", "#2f2f2f"), control("□", "maximise", "#2f2f2f"), control("×", "hide", "#2f2f2f"))
+    bar.appendChild(controls)
+    document.body.appendChild(bar)
+    document.documentElement.style.cssText += ";border-radius:14px;overflow:hidden;background:#000"
+    document.body.style.cssText += ";border-radius:14px;overflow:hidden"
+}
+
 function summarizeRequest(text) {
     const items = parseRequests(text)
     if (!items.length) return "FS → request"
@@ -1009,6 +1055,7 @@ window.GPTFS = {
 }
 
 function start() {
+    buildTitlebar()
     buildUI()
     baseline = new Set(assistantMessages().map(messageKey))
     hydrateCount = -1
