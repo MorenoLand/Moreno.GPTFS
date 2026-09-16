@@ -154,15 +154,18 @@ func main() {
 	bootstrapHTML := "<!doctype html><html><head><meta charset='utf-8'></head><body><script>location.replace(" + string(encodedURL) + ")</script></body></html>"
 
 	window := app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Name:               "chatgpt",
-		Title:              "Moreno.GPTFS",
-		HTML:               bootstrapHTML,
-		JS:                 injectedJS,
-		Width:              1500,
-		Height:             950,
-		MinWidth:           900,
-		MinHeight:          650,
-		BackgroundColour:   application.NewRGB(13, 13, 13),
+		Name:             "chatgpt",
+		Title:            "Moreno.GPTFS",
+		HTML:             bootstrapHTML,
+		JS:               injectedJS,
+		Width:            1500,
+		Height:           950,
+		MinWidth:         900,
+		MinHeight:        650,
+		BackgroundColour: application.NewRGB(13, 13, 13),
+		Permissions: map[application.PermissionType]application.Permission{
+			application.PermissionNotifications: application.PermissionAllow,
+		},
 		DevToolsEnabled:    true,
 		ZoomControlEnabled: true,
 		Windows: application.WindowsWindow{

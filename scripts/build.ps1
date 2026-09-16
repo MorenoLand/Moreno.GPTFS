@@ -29,7 +29,7 @@ Set-Content -LiteralPath $rc -Value 'IDI_ICON1 ICON "appicon.ico"' -Encoding asc
 try {
     & windres -i $rc -o $syso -O coff
     if ($LASTEXITCODE -ne 0) { throw "windres failed with exit code $LASTEXITCODE" }
-    go build -tags production -trimpath -ldflags="-s -w -H windowsgui" -o $output $root
+    go build -buildvcs=false -tags production -trimpath -ldflags="-s -w -H windowsgui" -o $output $root
     if ($LASTEXITCODE -ne 0) { throw "go build failed with exit code $LASTEXITCODE" }
     & upx --best --lzma $output
     if ($LASTEXITCODE -ne 0) { throw "UPX failed with exit code $LASTEXITCODE" }
