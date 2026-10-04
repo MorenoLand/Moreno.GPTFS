@@ -55,7 +55,7 @@ let hydrateChangedAt = Date.now()
 let button, panel, armButton, protocolButton, sessionExecBtn
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
-const messages = role => [...document.querySelectorAll(`[data-message-author-role="${role}"]`)]
+const messages = role => [...document.querySelectorAll(`[data-message-author-role="${role}"],[data-local-conversation-final-${role}="true"]`)]
 const assistantMessages = () => messages("assistant")
 const userMessages = () => messages("user")
 
@@ -282,8 +282,18 @@ function parseRequests(text) {
     return blocks.length ? blocks : parseLegacy(text)
 }
 
+function textWithLineBreaks(node) {
+    if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || ""
+    if (node.nodeType !== Node.ELEMENT_NODE) return ""
+    if (node.tagName === "BR") return "\n"
+    const text = [...node.childNodes].map(textWithLineBreaks).join("")
+    return /^(DIV|P|LI|PRE|BLOCKQUOTE)$/.test(node.tagName) && text && !text.endsWith("\n") ? text + "\n" : text
+}
+
 function rawText(el) {
-    return normalizeProtocolText(el?.__gptfsRawText ?? el?.innerText ?? el?.textContent ?? "")
+    const content = el?.matches?.("[data-markdown-text-style]") ? el : el?.querySelector?.("[data-markdown-text-style]") || el
+    const hidden = content?.closest?.('[data-gptfs-original="1"]')?.style.display === "none"
+    return normalizeProtocolText(hidden ? textWithLineBreaks(content) : content?.innerText || textWithLineBreaks(content))
 }
 
 function requestOnly(text) {
@@ -292,6 +302,11 @@ function requestOnly(text) {
     let rest = text
     for (const r of reqs) rest = rest.replace(r.raw, "")
     return rest.trim() === ""
+}
+
+function pendingRequest(text) {
+    const start = /^[ \t]*(?:```[a-zA-Z0-9_-]*[ \t]*\n)?[ \t]*@@GPT(?:FS(?::[A-Za-z0-9._-]*)?)?/m.exec(text)
+    return !!start && !text.slice(0, start.index).trim() && !parseRequests(text).length
 }
 
 function resultOnly(text) {
@@ -312,9 +327,9 @@ function buildTitlebar() {
     if (document.getElementById("gptfs-titlebar")) return
     const bar = document.createElement("div")
     bar.id = "gptfs-titlebar"
-    bar.style.cssText = "position:fixed;inset:0 0 auto 0;height:38px;z-index:2147483646;display:flex;align-items:center;background:#000;border-bottom:1px solid #2f2f2f;border-radius:14px 14px 0 0;color:#ececf1;font:12px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;app-region:drag;user-select:none;overflow:hidden"
+    bar.style.cssText = "position:fixed;inset:0 0 auto 0;height:38px;z-index:2147483646;display:flex;align-items:center;background:#000;border-radius:14px 14px 0 0;color:#ececf1;font:12px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;app-region:drag;user-select:none;overflow:hidden"
     const brand = document.createElement("div")
-    brand.textContent = "Moreno.GPTFS"
+    brand.textContent = "ChatGPT Bridge"
     brand.style.cssText = "display:flex;align-items:center;gap:8px;padding:0 14px;flex:1;font-weight:600;letter-spacing:.01em"
     if (cfg?.icon) {
         const icon = document.createElement("img")
@@ -332,7 +347,7 @@ function buildTitlebar() {
         button.type = "button"
         button.textContent = label
         button.title = action === "hide" ? "Hide to system tray" : action === "close" ? "Close" : action === "minimise" ? "Minimize" : "Maximize"
-        button.style.cssText = `width:46px;border:0;background:transparent;color:#b8b8c0;font:16px 'Segoe UI Symbol',sans-serif;cursor:pointer;app-region:no-drag`
+        button.style.cssText = `width:40px;border:0;background:transparent;color:#b8b8c0;font:14px 'Segoe UI Symbol',sans-serif;cursor:pointer;app-region:no-drag`
         button.onmouseenter = () => { button.style.background = hover }
         button.onmouseleave = () => { button.style.background = "transparent" }
         button.onclick = () => windowAction(action)
@@ -341,8 +356,11 @@ function buildTitlebar() {
     controls.append(control("—", "minimise", "#2f2f2f"), control("□", "maximise", "#2f2f2f"), control("×", "hide", "#2f2f2f"))
     bar.appendChild(controls)
     document.body.appendChild(bar)
-    document.documentElement.style.cssText += ";border-radius:14px;overflow:hidden;background:#000"
-    document.body.style.cssText += ";border-radius:14px;overflow:hidden"
+    const headerOffset = document.createElement("style")
+    headerOffset.textContent = '[data-app-shell-header-obstacle="true"]{margin-top:70px!important}[data-app-shell-main-content-layout="default"]{height:calc(100vh - 38px)!important;max-height:calc(100vh - 38px)!important;min-height:0!important}'
+    document.head.appendChild(headerOffset)
+    document.documentElement.style.cssText += ";border-radius:14px;overflow:hidden;background:#000;height:100vh"
+    document.body.style.cssText += ";border-radius:14px;overflow:hidden;padding-top:38px;box-sizing:border-box;height:100vh"
 }
 
 function summarizeRequest(text) {
@@ -376,7 +394,6 @@ function summarizeResult(text) {
 }
 
 function decorate(el, label, ok = true) {
-    if (!el.__gptfsRawText) el.__gptfsRawText = el.innerText || el.textContent || ""
     let chip = el.querySelector(':scope > [data-gptfs-chip="1"]')
     if (!chip) {
         chip = document.createElement("div")
@@ -419,10 +436,25 @@ function applyVisibility(el) {
     chip.title = reveal ? "Click to collapse GPTFS protocol" : "Click to reveal GPTFS protocol"
 }
 
+function restoreMessage(el) {
+    const chip = el.querySelector(':scope > [data-gptfs-chip="1"]')
+    if (!chip) return
+    chip.remove()
+    for (const child of [...el.children]) {
+        if (child.dataset.gptfsOriginal !== "1") continue
+        child.style.display = child.dataset.gptfsOldDisplay || ""
+        delete child.dataset.gptfsOriginal
+        delete child.dataset.gptfsOldDisplay
+    }
+    delete el.dataset.gptfsReveal
+}
+
 function decorateMessages() {
     for (const el of assistantMessages()) {
         const text = rawText(el)
         if (requestOnly(text)) decorate(el, summarizeRequest(text), true)
+        else if (pendingRequest(text)) decorate(el, "FS → receiving request", true)
+        else restoreMessage(el)
     }
     for (const el of userMessages()) {
         const text = rawText(el)
@@ -697,7 +729,7 @@ return results
 
 function messageKey(el) {
     if (!el) return "msg_unknown"
-    const dataId = el.dataset?.messageId || el.getAttribute("data-message-id")
+    const dataId = el.dataset?.messageId || el.getAttribute("data-message-id") || el.querySelector("[data-chatgpt-selection-message-id]")?.getAttribute("data-chatgpt-selection-message-id")
     if (dataId) return dataId
     const turn = el.closest('[data-testid^="conversation-turn-"]')
     if (turn) {
@@ -711,12 +743,12 @@ function messageKey(el) {
 }
 
 function isTurnAlreadyAnswered(assistantEl) {
-    const all = [...document.querySelectorAll('[data-message-author-role]')]
+    const all = [...document.querySelectorAll('[data-message-author-role],[data-local-conversation-final-assistant="true"],[data-local-conversation-final-user="true"]')]
     const idx = all.indexOf(assistantEl)
     if (idx < 0) return false
     for (let i = idx + 1; i < all.length; i++) {
         const m = all[i]
-        if (m.getAttribute("data-message-author-role") === "user") {
+        if (m.getAttribute("data-message-author-role") === "user" || m.matches('[data-local-conversation-final-user="true"]')) {
             const txt = rawText(m)
             if (txt.includes("@@GPTFS_RESULT") || txt.includes("@@DATA")) {
                 return true

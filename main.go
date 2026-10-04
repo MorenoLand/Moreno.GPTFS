@@ -53,7 +53,7 @@ func main() {
 
 	var app *application.App
 	app = application.New(application.Options{
-		Name:        "Moreno.GPTFS",
+		Name:        "ChatGPT Bridge",
 		Description: "ChatGPT desktop wrapper with local filesystem tools",
 		Icon:        icon,
 		Windows: application.WindowsOptions{
@@ -155,13 +155,11 @@ func main() {
 
 	window := app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:             "chatgpt",
-		Title:            "Moreno.GPTFS",
+		Title:            "ChatGPT Bridge",
 		HTML:             bootstrapHTML,
 		JS:               injectedJS,
-		Width:            1500,
-		Height:           950,
-		MinWidth:         900,
-		MinHeight:        650,
+		Width:            1200,
+		Height:           800,
 		BackgroundColour: application.NewRGB(13, 13, 13),
 		Permissions: map[application.PermissionType]application.Permission{
 			application.PermissionNotifications: application.PermissionAllow,
@@ -187,11 +185,11 @@ func main() {
 	window.OnWindowEvent(events.Windows.WindowClosing, func(_ *application.WindowEvent) { window.Hide() })
 
 	trayMenu := application.NewMenu()
-	trayMenu.Add("Show Moreno.GPTFS").OnClick(func(*application.Context) { window.Show().Focus() })
+	trayMenu.Add("Show ChatGPT Bridge").OnClick(func(*application.Context) { window.Show().Focus() })
 	trayMenu.AddSeparator()
 	trayMenu.Add("Exit").OnClick(func(*application.Context) { app.Quit() })
 	tray := app.SystemTray.New().SetIcon(icon)
-	tray.SetTooltip("Moreno.GPTFS")
+	tray.SetTooltip("ChatGPT Bridge")
 	tray.AttachWindow(window).SetMenu(trayMenu).OnClick(func() { tray.ToggleWindow() }).OnRightClick(func() { tray.ShowMenu() })
 
 	window.Show()
